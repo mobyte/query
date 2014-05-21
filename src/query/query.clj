@@ -1,40 +1,53 @@
 (ns query.query
   (:require [clojure.java.jdbc :as jdbc]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [clojure.pprint :refer [pp pprint]])
   (:import (java.sql PreparedStatement)))
 
 (def ^:dynamic *debug-mode* nil)
 
 ;;;; utils
 
-(defn- psymbol [s]
-  [s []])
-
-(defn- field-name [field]
-  (cond (map? field) (str (:table field) "." (:name field))
-        (keyword? field) (name field)
-        :else field))
-
-(defn- pe-field-name [field]
-  (cond (map? field) (psymbol (str (:table field) "." (:name field)))
-        (keyword? field) (psymbol (name field))
-        (sequential? field) field
-        :else (psymbol (name field))))
-
 (defn- join-with
   "[\"s1\" \"s2\" ... \"sn\"], \"sep\" -> \"s1 sep s2 sep ... sep sn\""
-  [items sep]
-  (apply str (str/join (str sep " ") items)))
+  [sep items]
+  (apply str (str/join sep items)))
 
 (defn- cjoin
   "Join strings with comma separator"
   [& items]
-  (join-with items ", "))
+  (join-with ", " items))
 
 (defn- sjoin
   "Join strings with space separator"
   [& items]
-  (join-with items ""))
+  (join-with " " items))
+
+(defn- is-pexpr? [pexpr]
+  (and (vector? pexpr)
+       (string? (first pexpr))
+       (sequential? (second pexpr))))
+
+(defn- psymbol [s]
+  "\"s\" -> [\"s\" []]"
+  (if (is-pexpr? s)
+    s
+    [s []]))
+
+(defn- wrap-double-quotes [s]
+  (str "\"" s "\""))
+
+(defn- field-name [field]
+  (let [[table files] (->> (.split (name field) "\\.")
+                           (map wrap-double-quotes))]
+    (if files
+      (join-with "." [table files])
+      table)))
+
+(defn- pe-field-name [field]
+  (if (is-pexpr? field)
+    field
+    (psymbol (field-name field))))
 
 ;;;; pexpression utils ([<string expression>" [args]])
 
@@ -48,21 +61,12 @@
   [s [sexpr args]]
   [(sjoin s sexpr) args])
 
-(defn- to-front
-  "\"str\", [\"expr\" args] -> [\"str expr\" args]"
-  [s [sexpr args]]
-  [(str s sexpr) args])
-
 (defn- pexpr
   "expr -> [\"sexpr\" args]"
   [expr]
   (cond (sequential? expr) (wrap-brackets expr)
-        (map? expr) [(field-name expr) []]
+        (keyword? expr) [(field-name expr) []]
         :else ["?" [expr]]))
-
-(defn- psymbol [s]
-  "\"s\" -> [\"s\" []]"
-  [s []])
 
 (defn- join-pexprs
   "[[\"expr1\" [arg11 arg12 ...]] [\"expr2\" [arg21 arg22 ...]] ...]\n-> [\"expr1 expr2 ...\" [arg11 arg12 ... arg21 arg22 ...]]"
@@ -86,7 +90,7 @@
 ;;;; process conditions
 
 (defn e-in [field exprs]
-  (join-pexprs (pexpr field)
+  (join-pexprs (pe-field-name field)
                (psymbol "in")
                (wrap-brackets (pe-cjoin exprs))))
 
@@ -161,25 +165,28 @@
                 (map (fn [[table pcond]]
                        (apply join-pexprs (concat (map psymbol [(name type) 
                                                                 "join" 
-                                                                table])
+                                                                (field-name table)])
                                                   [pcond])))
                      joins))])
 
 (defn inner-join [& joins]
   (join* :inner joins))
 
-(defn outer-join [& joins]
-  (join* :outer joins))
+(defn left-join [& joins]
+  (join* :left joins))
+
+(defn right-join [& joins]
+  (join* :right joins))
 
 ;;;; fields
 
 (defn sqlfn [f & exprs]
-  (to-front (name f) (wrap-brackets (pe-cjoin exprs))))
+  (add-front (name f) (wrap-brackets (pe-cjoin exprs))))
 
-(defn as [expr alias]
-  (join-pexprs (pe-field-name expr)
-               (psymbol "as") 
-               (psymbol (name alias))))
+(defn as [field alias]
+  (psymbol (sjoin (field-name field)
+                  "as" 
+                  (name alias))))
 
 (defn fields [& flds]
   [:fields (if (#{:all :* [:all] [:*]} flds)
@@ -209,14 +216,14 @@
   (conj forms [:select (psymbol "select")]))
 
 (defn- add-from [forms table]
-  (conj forms [:from (psymbol (sjoin "from" table))]))
+  (conj forms [:from (psymbol (sjoin "from" (name table)))]))
 
 (defn- add-optional-fields [forms]
   (if (:fields forms)
     forms
     (conj forms (fields :*))))
 
-(defn select [table & forms]
+(defn select [db table & forms]
   (let [forms (into {} (-> forms
                            (add-select)
                            (add-from table)
@@ -224,22 +231,25 @@
         pexprs (sorted-pexprs forms)
         pquery (apply join-pexprs pexprs)
         query (into [] (cons (first pquery) (second pquery)))]
-    (when *debug-mode* (println pquery) (println query))
-    (jdbc/with-query-results rs query 
-      (doall rs))))
+    (when *debug-mode*
+      (pprint pquery)
+      (pprint query))
+    (jdbc/query db
+                query 
+                :result-set-fn #(doall %))))
 
 ;;;; with db
 
-(defmacro with-db [db & body]
-  `(jdbc/with-connection ~db
-     ~@body))
+;; (defmacro with-db [db & body]
+;;   `(jdbc/with-connection ~db
+;;      ~@body))
 
-(defmacro with-tr [db & body]
-  `(jdbc/with-connection ~db
-     (jdbc/transaction
-      (try ~@body
-           (catch Exception e#
-             (try (jdbc/set-rollback-only)
-                  (catch Exception inner-e#
-                    (throw inner-e#)))
-             (throw e#))))))
+;; (defmacro with-tr [db & body]
+;;   `(jdbc/with-connection ~db
+;;      (jdbc/transaction
+;;       (try ~@body
+;;            (catch Exception e#
+;;              (try (jdbc/set-rollback-only)
+;;                   (catch Exception inner-e#
+;;                     (throw inner-e#)))
+;;              (throw e#))))))

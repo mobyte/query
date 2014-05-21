@@ -1,27 +1,29 @@
 (ns query.query-test
-  (:use clojure.test
-        query.query
-        query.gentablecolumns
-        db.entities
-        [clojure.pprint :only (pprint)])
-  (:require [db.conf]))
+  (:require [clojure.test :refer :all]
+            [query.query :refer :all]
+            [clojure.pprint :refer [pprint]]
+            [clojure.java.jdbc :as jdbc]))
 
-(def ^:private db db.conf/db)
+(def ^:private db {:db "query_example"
+                   :password ""
+                   :classname "org.postgresql.Driver"
+                   :subprotocol "postgresql"
+                   :user "postgres"
+                   :subname "//localhost:5432/query_example"})
 
 (defn test-select [& client-ids]
-  (with-db db
-    (select table-clients
-            (fields clients-name
-                    (as emails-value :email)
-                    (as phones-value :phone))
-            (inner-join [table-phones (on (:= phones-client clients-id))]
-                        [table-emails (on (:= emails-client clients-id))])
-            (where (:and (:in clients-id (or client-ids [1]))
-                         (:not (:= emails-value "spammer@hacker.org"))))
-            (order [clients-id :desc])
-            (limit 20))))
+  (select db :clients
+          (fields :clients.name
+                  (as :emails.value :email)
+                  (as :phones.value :phone))
+          (inner-join [:phones (on (:= :phones.client :clients.id))]
+                      [:emails (on (:= :emails.client :clients.id))])
+          (where (:and (:in :clients.id (or client-ids [1]))
+                       (:not (:= :emails.value "spammer@hacker.org"))))
+          (order [:clients.id :desc])
+          (limit 20)))
 
-(defn test-select-group []
+(comment defn test-select-group []
   (with-db db
     (select table-clients
             (fields clients-id
@@ -32,7 +34,3 @@
             (group clients-id)
             (where (:not (:= emails-value "spammer@hacker.org")))
             (having (:> (sqlfn :count clients-id) 1)))))
-
-(deftest a-test
-  (testing "FIXME, I fail."
-    (is (= 0 1))))
